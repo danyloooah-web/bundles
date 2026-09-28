@@ -20,6 +20,10 @@ PREFILL_DOWN = 'held'
 PREFILL_FOLD = 'bf16'
 # prefill chunks of at least UP8_MIN rows run the MoE up on INT8 tensor cores (i8x_up8.py, PRECISION CHANGE)
 UP8_MIN = 1024
+# the prefill MoE up as qk_moe_prefill_i8.cu up_i8g (native, the same per-group INT8 rows and per-channel INT8 copy as
+# i8x_up8.py; the shared expert's gate/up rows quantized per channel per call: a PRECISION CHANGE for that expert)
+UP_NATIVE = True
+UP_NATIVE_OK = True
 FOLD_MODES = {'exact': 0, 'bf16': 8}
 _prefill_state = {'fallback': None, 'warmed': False, 'error': None, 'counters': {}, 'up8': None}
 
@@ -208,13 +212,21 @@ def prefill_king_i8(x, router_w, gate_w, copy, s13, s2, down=None, fold=None, pa
     mode = FOLD_MODES[fold or PREFILL_FOLD] | diag
     return ext.forward_i8(x, logits, gate_w, copy.blocks, empty, empty if down_q8 else copy.w2, s13, s2, cnt, 1, int(down_q8), parts, mode)[0]
 
-def prefill_up8(x, router_w, gate_w, copy, s13, s2):
+def prefill_up8(x, router_w, gate_w, copy, s13, s2, native=True):
     """The king's i8 prefill with its up GEMM on INT8 tensor cores (routing and the held-BF16 down unchanged)."""
     ext = _prefill_ext()
     logits = F.linear(x, router_w)
     cnt = _prefill_counters(x.device, ext.COUNTERS)
     _, topk_w, pos_tk, sg, n_pairs, mt, pairs, sorted_tok = ext.route_i8(x, logits, gate_w, cnt)
-    h = i8x_up8.up(x, copy.blocks, s13, offsets(copy.hidden, copy.inter), mt, sorted_tok)
+    if UP_NATIVE and UP_NATIVE_OK and native:
+        xq, xs = i8x_up8.quant_g128(x)
+        n, k = s13.shape
+        sq = torch.empty((n, k), dtype=torch.int8, device=x.device)
+        sc = torch.empty((n, k // GROUP), dtype=torch.float16, device=x.device)
+        quantize_channel(s13, sq, sc)
+        h = ext.up_i8g(x, xq, xs, copy.blocks, sq, sc[:, 0].float(), mt, sorted_tok)
+    else:
+        h = i8x_up8.up(x, copy.blocks, s13, offsets(copy.hidden, copy.inter), mt, sorted_tok)
     return ext.down_i8(x, copy.w2, s2, cnt, h, topk_w, pos_tk, sg, n_pairs, mt, pairs, sorted_tok)
 
 def warm_prefill_king(copy, router_w, gate_w, s13, s2):
@@ -232,10 +244,23 @@ def warm_prefill_king(copy, router_w, gate_w, s13, s2):
             raise RuntimeError('i8x: the king_i8 prefill warm-up returned non-finite values')
         try:
             for _ in range(2):
-                out8 = prefill_up8(x, router_w, gate_w, copy, s13, s2)
+                out8 = prefill_up8(x, router_w, gate_w, copy, s13, s2, False)
             _sync(device)
             if not bool(torch.isfinite(out8).all()):
                 raise RuntimeError('i8x: the up8 prefill warm-up returned non-finite values')
+            if UP_NATIVE:
+                global UP_NATIVE_OK
+                try:
+                    for _ in range(2):
+                        outn = prefill_up8(x, router_w, gate_w, copy, s13, s2, True)
+                    _sync(device)
+                    if not bool(torch.isfinite(outn).all()):
+                        raise RuntimeError('i8x: the native up warm-up returned non-finite values')
+                except Exception as exc:  # i8x_up8.py's Triton up then serves every chunk
+                    UP_NATIVE_OK = False
+                    line = f'CACHEON-I8X: ERROR stage=warm_up_native error={exc!r} result=up8 pid={os.getpid()}'
+                    print(line, flush=True)
+                    print(line, file=sys.stderr, flush=True)
         except Exception as exc:  # the up8 path is then skipped; the king_i8 prefill serves every chunk
             st['up8'] = exc
             line = f'CACHEON-I8X: ERROR stage=warm_up8 error={exc!r} result=king_i8 pid={os.getpid()}'

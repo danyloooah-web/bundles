@@ -95,6 +95,14 @@ def _up(x_ptr, xq_ptr, xs_ptr, q_ptr, s_ptr, s13_ptr, h_ptr, mt_ptr, tok_ptr, H:
     tl.store(h_ptr + r[:, None] * I + offs_n[None, :], (g / (1.0 + tl.exp(-g)) * u).to(tl.bfloat16),
              mask=valid[:, None])
 
+def quant_g128(x: torch.Tensor):
+    """``x`` rows as int8 with one scale per row and 128-column group (the up's own activation quantizer)."""
+    T = x.shape[0]
+    xq = torch.empty((T, H), dtype=torch.int8, device=x.device)
+    xs = torch.empty((T, H // G), dtype=torch.float32, device=x.device)
+    _quant_rows[(T,)](x, xq, xs, K=H, G=G, num_warps=4)
+    return xq, xs
+
 def up(x: torch.Tensor, blocks: torch.Tensor, s13: torch.Tensor, offsets, mt: torch.Tensor,
        sorted_tok: torch.Tensor, cfg=None) -> torch.Tensor:
     q2, c13, c2, eb = offsets

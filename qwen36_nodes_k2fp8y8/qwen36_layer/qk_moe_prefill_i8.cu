@@ -212,6 +212,20 @@ __device__ __forceinline__ uint64_t gmma_desc(uint32_t smem_addr) {
   return static_cast<uint64_t>((smem_addr & 0x3FFFF) >> 4) | (static_cast<uint64_t>(1024 >> 4) << 32) |
          (static_cast<uint64_t>(1) << 62);
 }
+// wgmma.mma_async m64n128k32 s32 (+)= s8 x s8, both operands K-major in shared memory; scale_d 0 starts a fresh sum.
+__device__ __forceinline__ void wgmma_m64n128k32_s8(int (&d)[64], uint64_t da, uint64_t db, int scale_d) {
+  asm volatile(
+      "{\n"
+      ".reg .pred p;\n"
+      "setp.ne.b32 p, %66, 0;\n"
+      "wgmma.mma_async.sync.aligned.m64n128k32.s32.s8.s8 "
+      "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, "
+      "%64, %65, p;\n"
+      "}\n"
+      : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3]), "+r"(d[4]), "+r"(d[5]), "+r"(d[6]), "+r"(d[7]), "+r"(d[8]), "+r"(d[9]), "+r"(d[10]), "+r"(d[11]), "+r"(d[12]), "+r"(d[13]), "+r"(d[14]), "+r"(d[15]), "+r"(d[16]), "+r"(d[17]), "+r"(d[18]), "+r"(d[19]), "+r"(d[20]), "+r"(d[21]), "+r"(d[22]), "+r"(d[23]), "+r"(d[24]), "+r"(d[25]), "+r"(d[26]), "+r"(d[27]), "+r"(d[28]), "+r"(d[29]), "+r"(d[30]), "+r"(d[31]), "+r"(d[32]), "+r"(d[33]), "+r"(d[34]), "+r"(d[35]), "+r"(d[36]), "+r"(d[37]), "+r"(d[38]), "+r"(d[39]), "+r"(d[40]), "+r"(d[41]), "+r"(d[42]), "+r"(d[43]), "+r"(d[44]), "+r"(d[45]), "+r"(d[46]), "+r"(d[47]), "+r"(d[48]), "+r"(d[49]), "+r"(d[50]), "+r"(d[51]), "+r"(d[52]), "+r"(d[53]), "+r"(d[54]), "+r"(d[55]), "+r"(d[56]), "+r"(d[57]), "+r"(d[58]), "+r"(d[59]), "+r"(d[60]), "+r"(d[61]), "+r"(d[62]), "+r"(d[63])
+      : "l"(da), "l"(db), "r"(scale_d));
+}
+__device__ __forceinline__ void fence_operand(int& r) { asm volatile("" : "+r"(r)::"memory"); }
 __device__ __forceinline__ void wgmma_m64n256k16(float (&d)[128], uint64_t da, uint64_t db) {
   asm volatile(
       "{\n"
@@ -1296,6 +1310,201 @@ __global__ void __launch_bounds__(384, 1)
   }
   cluster_sync();
 }
+
+#if QMOE_Q8
+// ---------------------------------------------------------------- up_i8g: the prefill MoE up on INT8 tensor cores
+// A PRECISION CHANGE with i8x_up8.py's arithmetic class: x rows quantized per 128-column group (i8x_up8._quant_rows),
+// the expert rows the per-channel INT8 copy, the shared expert's rows quantized per channel per call. Each k block
+// (128 columns = one group) is an s32 sum from zero per n128 half (wgmma m64n128k32 s8), folded into fp32 accumulators
+// with the row's group scale; the channel scale, silu(gate) * up and the bf16 h store follow as in the BF16 up.
+// 256 threads = two math warpgroups (255 registers: 128 fp32 + 64 s32 live values), each gathering its own 64 A rows
+// kGAhead k blocks ahead (cp.async, 4 x 16 B per thread per stage); thread 0 issues the B tiles by TMA. A stage is
+// refilled once all eight warps released it (empty barrier), so the warpgroups drift apart and one folds while the
+// other's wgmmas run. Units are (m-tile, n-block) of route_i8's zero-filled m-tile list, m-tile major.
+constexpr int kGStages = 4, kGAhead = 2;
+constexpr uint32_t kGA = 128 * 128, kGB = 256 * 128, kGD = 64 * 128 * 2;
+constexpr uint32_t kGSmem = kGStages * (kGA + kGB) + 2 * kGD + 2 * 256 * 4 + 2 * kGStages * 8;
+static_assert(kGSmem <= 232448, "up_i8g smem must fit the 227 KiB opt-in");
+struct UpGArgs {
+  const int4* mt;
+  int n_units;  // m-tiles x 4 n-blocks
+  const int* sorted_tok;
+  const uint8_t* xq;   // [T, kH] int8
+  const float* xsg;    // [T, kH / 128]
+  const uint8_t* q8;   // the INT8 copy [kE][kQ8Expert]
+  const float* ss13;   // [2 kI] shared expert channel scales
+};
+__global__ void __launch_bounds__(256, 1) up_g128_kernel(const UpGArgs a, const __grid_constant__ CUtensorMap tm_w,
+                                                       const __grid_constant__ CUtensorMap tm_sw,
+                                                       const __grid_constant__ CUtensorMap tm_h) {
+  extern __shared__ __align__(1024) uint8_t smem[];
+  uint8_t* sA = smem;
+  uint8_t* sB = sA + kGStages * kGA;
+  uint8_t* sD = sB + kGStages * kGB;
+  float* sScale = reinterpret_cast<float*>(sD + 2 * kGD);  // per warpgroup: the unit's [gate 128 | up 128] scales
+  uint64_t* full = reinterpret_cast<uint64_t*>(sScale + 512);
+  uint64_t* empty = full + kGStages;
+  const int tid = threadIdx.x, wg = tid / 128, wt = tid % 128, warp = tid / 32, wi = warp % 4, lane = tid % 32;
+  if (tid == 0) {
+#pragma unroll
+    for (int s = 0; s < kGStages; ++s) {
+      mbar_init(&full[s], 256 + 1);  // 256 cp.async arrivals + thread 0's expect_tx
+      mbar_init(&empty[s], 8);       // one per warp
+    }
+    fence_barrier_init();
+  }
+  if (tid == 32) {
+    prefetch_tmap(&tm_w);
+    prefetch_tmap(&tm_sw);
+    prefetch_tmap(&tm_h);
+  }
+  __syncthreads();
+  const uint64_t pol_x = kEvictNormal;  // evict_last here costs the down that follows ~5 %
+  const int step = static_cast<int>(gridDim.x);
+  auto next_active = [&](int u) {
+    while (u < a.n_units && __ldg(&a.mt[u >> 2].z) <= 0) u += step;
+    return u;
+  };
+  // producer: slot (pu, pkb) into pstage; this thread's A chunks: rows 64 wg + wt / 8 + 16 i, 16-byte chunk wt % 8
+  int pu = next_active(static_cast<int>(blockIdx.x)), pkb = 0, pstage = 0;
+  uint32_t pphase = 0;
+  int4 pinfo = make_int4(0, 0, 0, 0);
+  const uint8_t* psrc[4];
+  auto load_unit = [&]() {
+    pinfo = pu < a.n_units ? a.mt[pu >> 2] : make_int4(0, 0, 0, 0);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int r = 64 * wg + wt / 8 + 16 * i;
+      psrc[i] = r < pinfo.z ? a.xq + static_cast<size_t>(a.sorted_tok[pinfo.y + r]) * kH + (wt % 8) * 16 : nullptr;
+    }
+  };
+  load_unit();
+  auto issue = [&]() {
+    if (pu >= a.n_units) return;
+    mbar_wait(&empty[pstage], pphase ^ 1);
+    uint64_t* bar = &full[pstage];
+    const uint32_t a_dst = smem_u32(sA + pstage * kGA);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int r = 64 * wg + wt / 8 + 16 * i;
+      if (psrc[i] != nullptr) cp_async16(a_dst + r * 128 + (((wt % 8) ^ (r & 7)) << 4), psrc[i] + pkb * 128, pol_x);
+    }
+    cp_async_arrive_noinc(bar);
+    if (tid == 0) {
+      const int n = pu & 3;
+      mbar_arrive_expect_tx(bar, kGB);
+      const uint32_t b_dst = smem_u32(sB + pstage * kGB);
+      const bool sh = pinfo.x == kE;
+      const CUtensorMap* m = sh ? &tm_sw : &tm_w;
+      const int brow = sh ? 0 : pinfo.x * (kQ8Expert / kH);
+      tma_load_2d(b_dst, m, bar, pkb * 128, brow + n * 128, kEvictNormal);
+      tma_load_2d(b_dst + kGB / 2, m, bar, pkb * 128, brow + kI + n * 128, kEvictNormal);
+    }
+    pstage = pstage + 1 == kGStages ? 0 : pstage + 1;
+    pphase ^= pstage == 0;
+    if (++pkb == kH / 128) {
+      pkb = 0;
+      pu = next_active(pu + step);
+      load_unit();
+    }
+  };
+#pragma unroll 1
+  for (int s = 0; s < kGAhead; ++s) issue();
+  int cstage = 0;
+  uint32_t cphase = 0;
+  const uint32_t a_base = smem_u32(sA) + wg * 64 * 128, b_base = smem_u32(sB);
+  const uint32_t d_base = smem_u32(sD) + wg * kGD;
+  float* sc = sScale + wg * 256;
+  float acc[128];
+#pragma unroll 1
+  for (int cu = next_active(static_cast<int>(blockIdx.x)); cu < a.n_units; cu = next_active(cu + step)) {
+    const int4 info = a.mt[cu >> 2];
+    const int n = cu & 3;
+    const bool active = info.z > wg * 64;
+    const int ra = wg * 64 + wi * 16 + lane / 4, rb = ra + 8;
+    const bool va = ra < info.z, vb = rb < info.z;
+    const float* sa_row = a.xsg + static_cast<size_t>(va ? a.sorted_tok[info.y + ra] : 0) * (kH / 128);
+    const float* sb_row = a.xsg + static_cast<size_t>(vb ? a.sorted_tok[info.y + rb] : 0) * (kH / 128);
+    float csc[2];  // this thread's two of the unit's 256 channel scales, stored after the mainloop
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      const int t = wt + 128 * j, ch = (t < 128 ? 0 : kI - 128) + n * 128 + t;
+      csc[j] = info.x == kE ? __ldg(a.ss13 + ch)
+                            : __half2float(__ushort_as_half(__ldg(reinterpret_cast<const unsigned short*>(
+                                  a.q8 + static_cast<size_t>(info.x) * kQ8Expert + kQ8C13) + ch * (kH / 128))));
+    }
+#pragma unroll
+    for (int i = 0; i < 128; ++i) acc[i] = 0.f;
+#pragma unroll 1
+    for (int kb = 0; kb < kH / 128; ++kb) {
+      issue();
+      mbar_wait(&full[cstage], cphase);
+      if (active) {
+        const float sa = va ? __ldg(sa_row + kb) : 0.f, sb = vb ? __ldg(sb_row + kb) : 0.f;
+        const uint32_t a_st = a_base + cstage * kGA, b_st = b_base + cstage * kGB;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {  // B rows [gate 128 | up 128]
+          // The group's s32 sum starts at kMagic, the bits of the float 1.5 x 2^23: the sum (|sum| < 2^22) then
+          // reads as the float 1.5 x 2^23 + sum exactly, and one fp32 subtraction yields it (cvt.rn.f32.s32 runs at
+          // a quarter of that rate and was the kernel's bound).
+          constexpr int kMagic = 0x4B400000;
+          int t[64];
+          wgmma_fence();
+#pragma unroll
+          for (int k = 0; k < 4; ++k)
+            wgmma_m64n128k32_s8(t, gmma_desc(a_st + k * 32), gmma_desc(b_st + half * (kGB / 2) + k * 32), k);
+          wgmma_commit();
+#pragma unroll
+          for (int i = 0; i < 64; ++i) fence_operand(t[i]);
+          wgmma_wait<0>();
+#pragma unroll
+          for (int j = 0; j < 16; ++j) {
+            float* f = acc + 64 * half + 4 * j;
+            f[0] = fmaf(static_cast<float>(t[4 * j]), sa, f[0]);
+            f[1] = fmaf(static_cast<float>(t[4 * j + 1]), sa, f[1]);
+            f[2] = fmaf(static_cast<float>(t[4 * j + 2]), sb, f[2]);
+            f[3] = fmaf(static_cast<float>(t[4 * j + 3]), sb, f[3]);
+          }
+          // the fold completes before the next half's partials are set up (one s32 set live at a time)
+#pragma unroll
+          for (int i = 0; i < 64; ++i) fence_operand(acc[64 * half + i]);
+        }
+      }
+      __syncwarp();
+      if (lane == 0) mbar_arrive(&empty[cstage]);
+      cstage = cstage + 1 == kGStages ? 0 : cstage + 1;
+      cphase ^= cstage == 0;
+    }
+    if (!active) continue;
+    // acc[4 i + q]: row ra (q < 2) / rb, column 8 i + 2 (lane % 4) + (q & 1) of [gate 128 | up 128]
+    if (wt == 0) tma_store_wait_read();
+    sc[wt] = csc[0], sc[wt + 128] = csc[1];
+    named_bar_sync(1 + wg, 128);  // sc written, sD free
+    const uint32_t row_addr = d_base + wi * 2048 + (lane % 16) * 128;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      const float2 wg2 = *reinterpret_cast<const float2*>(sc + 8 * i + 2 * (lane % 4));
+      const float2 wu2 = *reinterpret_cast<const float2*>(sc + 128 + 8 * i + 2 * (lane % 4));
+      float h[4];
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        const float g = acc[4 * i + q] * ((q & 1) ? wg2.y : wg2.x);
+        const float up = acc[4 * (i + 16) + q] * ((q & 1) ? wu2.y : wu2.x);
+        h[q] = g / (1.f + __expf(-g)) * up;
+      }
+      stsm_x2(pack_bf16(h[0], h[1]), pack_bf16(h[2], h[3]), row_addr + (i / 8) * 8192 + (((i % 8) ^ (lane % 8)) << 4));
+    }
+    fence_async_shared();
+    named_bar_sync(1 + wg, 128);  // sD staged, sc read
+    if (wt == 0) {
+#pragma unroll
+      for (int at = 0; at < 2; ++at) tma_store_2d(&tm_h, d_base + at * 8192, n * 128 + at * 64, info.y + wg * 64);
+      tma_store_commit();
+    }
+  }
+  if (wt == 0) tma_store_wait_all();
+}
+#endif
 using EncodeFn = CUresult (*)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*,
                               const cuuint64_t*, const cuuint32_t*, const cuuint32_t*, CUtensorMapInterleave,
                               CUtensorMapSwizzle, CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
@@ -1612,6 +1821,65 @@ std::vector<torch::Tensor> route_i8(torch::Tensor x, torch::Tensor logits, torch
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {topk_ids, topk_w, pos_tk, sg, n_pairs, mt, pairs, sorted_tok};
 }
+// Row-major uint8 [outer, inner] in boxes of [box_outer rows, 128 bytes], 128B swizzle.
+static CUtensorMap make_map_u8(const void* base, uint64_t inner, uint64_t outer, uint32_t box_outer) {
+  CUtensorMap map;
+  const cuuint64_t dims[2] = {inner, outer};
+  const cuuint64_t strides[1] = {inner};
+  const cuuint32_t box[2] = {128, box_outer};
+  const cuuint32_t estr[2] = {1, 1};
+  const CUresult r = encode_fn()(&map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<void*>(base), dims, strides, box,
+                                 estr, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+                                 CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  TORCH_CHECK(r == CUDA_SUCCESS, "cuTensorMapEncodeTiled (uint8) failed: ", static_cast<int>(r));
+  return map;
+}
+// route_i8's up GEMM on INT8 operands (up_g128_kernel): xq / xsg the rows of x as int8 with per-128-column-group
+// scales [T, 16] (i8x_up8._quant_rows), q8 the per-channel INT8 copy, sq / ss the shared expert's gate/up rows as int8
+// with one fp32 scale per row. Returns h [max_rows, kI] where the BF16 up writes it.
+torch::Tensor up_i8g(torch::Tensor x, torch::Tensor xq, torch::Tensor xsg, torch::Tensor q8, torch::Tensor sq,
+                     torch::Tensor ss, torch::Tensor mt, torch::Tensor sorted_tok) {
+  const int64_t T = x.size(0);
+  check_bf16(x, {T, kH}, "x");
+  TORCH_CHECK(xq.is_cuda() && xq.scalar_type() == torch::kInt8 && xq.is_contiguous() && xq.size(0) == T &&
+                  xq.size(1) == kH, "xq int8 [T, 2048]");
+  TORCH_CHECK(xsg.is_cuda() && xsg.scalar_type() == torch::kFloat32 && xsg.is_contiguous() &&
+                  xsg.numel() == T * (kH / 128), "xsg fp32 [T, 16]");
+  TORCH_CHECK(q8.is_cuda() && q8.scalar_type() == torch::kUInt8 && q8.is_contiguous() && q8.dim() == 2 &&
+                  q8.size(0) == kE && q8.size(1) == kQ8Expert, "q8 uint8 [256, Q8_EXPERT]");
+  TORCH_CHECK(sq.is_cuda() && sq.scalar_type() == torch::kInt8 && sq.is_contiguous() && sq.size(0) == 2 * kI &&
+                  sq.size(1) == kH, "sq int8 [1024, 2048]");
+  TORCH_CHECK(ss.is_cuda() && ss.scalar_type() == torch::kFloat32 && ss.is_contiguous() && ss.numel() == 2 * kI,
+              "ss fp32 [1024]");
+  const int64_t max_rows = T * (kTopK + 1) + (kE + 1) * (kRowAlign - 1);
+  const int64_t max_mt = (T * (kTopK + 1) + kBM - 1) / kBM + kE + 1;
+  TORCH_CHECK(sorted_tok.numel() == max_rows && mt.numel() == max_mt * 4, "route_i8's sorted_tok / mt");
+  static_assert(kQ8Expert % kH == 0, "an expert block is a whole number of 2048-byte rows");
+  const c10::cuda::CUDAGuard guard(x.device());
+  auto h = torch::empty({max_rows, kI}, x.options());
+  UpGArgs args;
+  args.mt = reinterpret_cast<const int4*>(mt.data_ptr<int>());
+  args.n_units = static_cast<int>(max_mt * 4);
+  args.sorted_tok = sorted_tok.data_ptr<int>();
+  args.xq = reinterpret_cast<const uint8_t*>(xq.data_ptr());
+  args.xsg = xsg.data_ptr<float>();
+  args.q8 = reinterpret_cast<const uint8_t*>(q8.data_ptr());
+  args.ss13 = ss.data_ptr<float>();
+  const CUtensorMap m_w = make_map_u8(q8.data_ptr(), kH, static_cast<uint64_t>(kE) * (kQ8Expert / kH), 128);
+  const CUtensorMap m_sw = make_map_u8(sq.data_ptr(), kH, 2 * kI, 128);
+  const CUtensorMap m_h = make_map(h.data_ptr(), kI, max_rows, 64);
+  static bool attr[64] = {};
+  const int dev = at::cuda::current_device();
+  TORCH_CHECK(dev < 64, "device index out of range");
+  if (!attr[dev]) {
+    C10_CUDA_CHECK(cudaFuncSetAttribute(up_g128_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kGSmem));
+    attr[dev] = true;
+  }
+  const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  up_g128_kernel<<<sms, 256, kGSmem, at::cuda::getCurrentCUDAStream()>>>(args, m_w, m_sw, m_h);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return h;
+}
 torch::Tensor down_i8(torch::Tensor x, torch::Tensor w2, torch::Tensor s2, torch::Tensor cnt, torch::Tensor h,
                       torch::Tensor topk_w, torch::Tensor pos_tk, torch::Tensor sg, torch::Tensor n_pairs,
                       torch::Tensor mt, torch::Tensor pairs, torch::Tensor sorted_tok) {
@@ -1665,5 +1933,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.attr("MODE_FAST_FOLD") = qmoe::kModeFastFold;
   m.def("route_i8", &qmoe::route_i8, "the block routing alone (topk, scan, scatter), mt zero-filled");
   m.def("down_i8", &qmoe::down_i8, "the down GEMM + combine over an external h");
+  m.def("up_i8g", &qmoe::up_i8g, "route_i8's up GEMM on per-group INT8 rows and the per-channel INT8 copy");
 #endif
 }
