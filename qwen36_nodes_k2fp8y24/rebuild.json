@@ -1,8 +1,0 @@
-{
-  "steps": [
-    {
-      "type": "repo_python",
-      "path": "cacheon/patchers/build_cuda_ext.py"
-    }
-  ]
-}
