@@ -1,0 +1,42 @@
+bundle_id = "qwen36-nodes-kb4"
+abi_version = "cacheon-op-abi-v0"
+
+[competition]
+target = "forward_pass"
+mode = "slot"
+arena = "qwen36-35b-h100-bf16-tp1"
+
+
+# v2 port = b0e9d402 (qwen36-nodes-k2fp8y18 = b9d3c95a + tanh.approx silu in up_i8g; b9d3c95a = a70adc41's inproj16 +
+# INT8 prefill up8 + channel-scaled INT8 experts, with int8 y / quant_img) with our orthogonal levers, each behind its own switch (OFF = the parent exactly):
+#   * lane dense (qwen36_layer/dense8.py LANE_DENSE, NOT bitwise): the attention qkv_proj and every decode o_proj /
+#     out_proj join DENSE8's runtime INT8 copies at <= 32 verify rows through qk_proj_decode.cu's qd8 W8A16 kernel; the
+#     GDN in_proj keeps the parent's qk_route.inproj16 at <= 16 rows.
+#   * lane PDENSE + pd38 (qwen36_layer/pdense.py ENABLED / PD38, NOT bitwise): the GDN prefill in_proj [q|k|v|z] in INT8
+#     with per-chunk smoothing (qk_inproj.cu, namespace qin8) on every recurrent layer; layer 38's prefill out_proj BF16.
+#   * lane P up (qwen36_layer/i8x_kernels.py UP_PATH per shape class, NOT bitwise): our W8A8 prefill routed up
+#     (qk_moe_prefill_i8.up_w8a8; ping-pong promotion PREFILL_UP_PP) in place of up_i8g, the parent's y8 down kept.
+#   * lane PD2 (qwen36_layer/i8x_kernels.py DOWN_W8A8 per shape class, NOT bitwise): our W8A8 prefill routed down
+#     (qk_moe_prefill_i8.down_w8a8), its routed y int8 per row x 128 columns on the parent's y8 layers (kY128 combine).
+#   * lane FUSED (qwen36_layer/i8x_decode.py FUSED, BIT FOR BIT): decode row batches of FUSED_MIN..16 rows run the
+#     persistent fused decode MoE (qk_moe_up16.cu `fused`) in place of the up16 / dn16 / Triton up + down pair.
+#   * kb4 (BIT FOR BIT): the INT8 prefill in_proj (qk_inproj.cu, namespace qin8) runs its conv front on seven epilogue
+#     warps (512 threads, setmaxnreg 168 / 88) instead of three; the arithmetic of every token is unchanged.
+#   New kernels are merged into existing units (14 cuda_sources: the build's extensions.json is capped at 16 MiB).
+
+[[ops]]
+slot = "model.layers.*"
+source = "qwen36_layer/layer.py"
+entry = "forward"
+prepare = "prepare"
+dtypes = ["bfloat16"]
+architectures = ["sm90"]
+cuda_sources = ["qwen36_layer/qk_proj_decode.cu", "qwen36_layer/qk_gdn_verify.cu", "qwen36_layer/qk_attn_verify.cu", "qwen36_layer/qk_moe_decode.cu", "qwen36_layer/qk_moe_prefill.cu", "qwen36_layer/qk_moe_prefill_i8.cu", "qwen36_layer/qk_kv_pages.cu", "qwen36_layer/qk_conv_gate.cu", "qwen36_layer/qk_gated_norm.cu", "qwen36_layer/qk_inproj.cu", "qwen36_layer/qk_lt.cu", "qwen36_layer/qk_route.cu", "qwen36_layer/qk_moe_dn16.cu", "qwen36_layer/qk_moe_up16.cu"]
+
+[[ops]]
+slot = "logits_processor"
+source = "qwen36_lmhead8/node.py"
+entry = "forward"
+prepare = "prepare"
+dtypes = ["bfloat16"]
+architectures = ["sm90"]
