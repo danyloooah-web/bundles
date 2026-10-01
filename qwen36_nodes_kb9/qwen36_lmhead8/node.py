@@ -142,9 +142,10 @@ class _Node:
             out = buf if buf is not None and rows >= LOGITS_BUF_MIN_ROWS and tuple(buf.shape) == (rows, weight.shape[0]) and weight.shape[0] == getattr(self.module, 'vocab_size', -1) and buf.device == weight.device else None
             tag = '_f32buf' if out is not None else ''
             if rows >= W8A8_MIN_ROWS:
-                _evidence(('lmhead8_w8a8x2' if W8A8_TWO_TERM else 'lmhead8_w8a8') + tag, rows)
+                cuda = W8A8_TWO_TERM and w8a8.cuda_two_term(rows, int(weight.shape[0]), int(weight.shape[1]), out if out is not None else hidden_states)
+                _evidence(('lmhead8_w8a8x2' if W8A8_TWO_TERM else 'lmhead8_w8a8') + ('_cuda' if cuda else '') + tag, rows)
                 return w8a8_linear(hidden_states, self.q, self.scale, out=out, two_term=W8A8_TWO_TERM)
-            _evidence('lmhead8_int8' + tag, rows)
+            _evidence('lmhead8_int8' + ('_cuda' if lmhead8.cuda_w8a16(hidden_states, self.q, self.scale, out) else '') + tag, rows)
             return w8a16_linear(hidden_states, self.q, self.scale, out=out)
         _evidence('lmhead8_stock_matmul', rows)
         return torch.matmul(hidden_states.to(weight.dtype), weight.T)

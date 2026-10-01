@@ -27,6 +27,11 @@ import torch
 import triton
 import triton.language as tl
 
+try:
+    import qk_proj_decode as _qpd  # kb8: lmh16_w8a16 (qwen36_layer's qk_proj_decode.cu)
+except ImportError:
+    _qpd = None
+
 # (max_rows, BLOCK_N, BLOCK_M, BLOCK_K, num_warps, num_stages): first row whose max_rows >= M wins.
 # The sweep winners of bench_lmhead8.py on the H100 (2026-09-25, Triton 3.7.1, torch 2.13, the real
 # [248320, 2048] lm_head; runs/20260925_qwen_king_b70160ce/evidence/q6/dev/lmhead8_1/bench_lmhead8.json),
@@ -147,6 +152,22 @@ def dequantize_rows(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return (q.float().view(N, ng, K // ng) * scale[:, :, None]).view(N, K)
 
 
+# kb8: 1..16 rows run qk_proj_decode.lmh16_w8a16, bit for bit the 16-row Triton config above (the same wgmma m64n16k16
+# chain per output in increasing k from zero, the same epilogue) -- 174 us vs 193 at 16 rows (lmh/t_lmh16.py)
+CUDA_ROWS = 16
+
+
+def cuda_w8a16(x: torch.Tensor, q: torch.Tensor, scale: torch.Tensor, out: torch.Tensor | None = None) -> bool:
+    M, K = x.shape
+    N = q.shape[0]
+    return (_qpd is not None and 1 <= M <= CUDA_ROWS and K == 2048 and x.dtype == torch.bfloat16 and x.is_contiguous()
+            and q.dtype == torch.int8 and q.is_contiguous() and q.shape[1] == K and N % 64 == 0
+            and scale.dim() == 1 and scale.dtype == torch.float32 and scale.is_contiguous() and scale.numel() == N
+            and (out is None or (out.dtype in (torch.float32, torch.bfloat16) and out.is_contiguous() and tuple(out.shape) == (M, N)
+                                 and out.device == x.device))
+            and q.device == x.device and scale.device == x.device)
+
+
 def w8a16_linear(x: torch.Tensor, q: torch.Tensor, scale: torch.Tensor, out: torch.Tensor | None = None,
                  config: tuple[int, int, int, int, int] | None = None) -> torch.Tensor:
     """x[M, K] bf16/fp16 (rows contiguous) @ dequant(q[N, K], scale)^T -> out[M, N] in x's dtype; a caller-given
@@ -163,6 +184,9 @@ def w8a16_linear(x: torch.Tensor, q: torch.Tensor, scale: torch.Tensor, out: tor
         raise ValueError(f"w8a16_linear: K={K} is not a multiple of BLOCK_K={block_k}")
     if out is None:
         out = torch.empty((M, N), dtype=x.dtype, device=x.device)
+    if config is None and cuda_w8a16(x, q, scale, out):
+        _qpd.lmh16_w8a16(x, q, scale, out)
+        return out
     num_m = triton.cdiv(M, block_m)
     grid = (triton.cdiv(N, block_n) * num_m,)
     _w8a16_kernel[grid](x, q, scale, out, M, N, K, x.stride(0), q.stride(0), out.stride(0),

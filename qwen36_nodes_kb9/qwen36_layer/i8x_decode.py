@@ -49,7 +49,7 @@ FUSED = True
 FUSED_MIN = 6
 FUSED_MAX = 16
 # SMs the fused kernel leaves free (<= 0: all minus this many) for the next layer's weight prefetch
-FUSED_GRID = -16
+FUSED_GRID = -8  # kb9: -16 -> -8 (dn/t_fused.py, MoE + next in_proj flow: -0.9 us/layer at 16 rows on the node and pod2; node lanes c6 -0.5 %; bitwise)
 TILES = {'g128': ((8, (64, 128, 8, 4), (64, 128, 4, 3), 4), (16, (32, 128, 4, 4), (64, 128, 4, 3), 16), (48, (32, 128, 4, 3), (64, 128, 4, 3), 1), (MAX_T, (32, 128, 4, 3), (128, 128, 4, 3), 2)), 'channel': ((MAX_T, (32, 256, 4, 3), (64, 128, 4, 3), 16),)}
 
 def pick(rows: int, g128: bool, tiles=None):

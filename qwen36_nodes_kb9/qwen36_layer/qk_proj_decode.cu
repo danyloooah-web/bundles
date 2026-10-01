@@ -1015,7 +1015,440 @@ void part(torch::Tensor x, torch::Tensor q, torch::Tensor s, torch::Tensor parti
 
 }  // namespace qd8
 
+// ---------------------------------------------------------------------------------------------------------------------
+// kb6 (merged here: the build caps the native units at 14): the lm_head's W8A8 two-term GEMM for 65..128 verify rows,
+// bit for bit qwen36_lmhead8.w8a8's Triton _w8a8_kernel (int32 dot products exact at any tiling; the epilogue is the
+// Triton contraction fma(float(a1), xs, float(a2) * xs2) * ws, bf16-rounded). Weight rows are the wgmma m side, 2-CTA
+// clusters share the token tiles by TMA multicast. lmh/t_lmh.py: 0 mismatches (fp32 / bf16 out) at 64..128 rows,
+// -7..-11 % vs Triton at 68..128 rows (124 rows: 280.6 -> 260.1 us); slower at 64 (Triton keeps <= 64).
+namespace lmh8 {
+#ifndef LMH8_FMA
+#define LMH8_FMA 1
+#endif
+#ifndef LMH8_STAGES
+#define LMH8_STAGES 4
+#endif
+constexpr int BV = 128, BT = 128, BK = 128, K = 2048, KB = K / BK, STAGES = LMH8_STAGES;
+constexpr uint32_t WBYTES = BV * BK, XBYTES = BT * BK, SBYTES = WBYTES + 2 * XBYTES;
+constexpr uint32_t SMEM = STAGES * SBYTES + 1024;
+static_assert(SMEM <= 232448 - 2048, "lmh8 smem");
+__device__ __forceinline__ uint32_t smem_u32(const void* p) { return static_cast<uint32_t>(__cvta_generic_to_shared(p)); }
+__device__ __forceinline__ void mbar_init(uint64_t* b, uint32_t n) { asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(smem_u32(b)), "r"(n)); }
+__device__ __forceinline__ void mbar_expect(uint64_t* b, uint32_t x) { asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_u32(b)), "r"(x) : "memory"); }
+__device__ __forceinline__ void mbar_wait(uint64_t* b, uint32_t ph) {
+  asm volatile("{\n.reg .pred p;\nW_%=:\nmbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n@!p bra W_%=;\n}\n" ::"r"(smem_u32(b)), "r"(ph) : "memory");
+}
+__device__ __forceinline__ void mbar_arrive_cl(uint64_t* b, uint32_t cta) {
+  asm volatile("{\n.reg .b32 ra;\nmapa.shared::cluster.u32 ra, %0, %1;\nmbarrier.arrive.shared::cluster.b64 _, [ra];\n}\n" ::"r"(smem_u32(b)), "r"(cta) : "memory");
+}
+__device__ __forceinline__ void tma2d(uint32_t dst, const CUtensorMap* m, uint64_t* b, int c0, int c1, uint64_t pol) {
+  asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1, {%3, %4}], [%2], %5;" ::"r"(dst),
+               "l"(reinterpret_cast<uint64_t>(m)), "r"(smem_u32(b)), "r"(c0), "r"(c1), "l"(pol) : "memory");
+}
+__device__ __forceinline__ void tma2d_mc(uint32_t dst, const CUtensorMap* m, uint64_t* b, int c0, int c1, uint16_t mask, uint64_t pol) {
+  asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint [%0], [%1, {%4, %5}], [%2], %3, %6;" ::"r"(dst),
+               "l"(reinterpret_cast<uint64_t>(m)), "r"(smem_u32(b)), "h"(mask), "r"(c0), "r"(c1), "l"(pol) : "memory");
+}
+__device__ __forceinline__ uint32_t cl_rank() { uint32_t r; asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(r)); return r; }
+__device__ __forceinline__ uint32_t cl_id() { uint32_t r; asm volatile("mov.u32 %0, %%clusterid.x;" : "=r"(r)); return r; }
+__device__ __forceinline__ uint32_t cl_n() { uint32_t r; asm volatile("mov.u32 %0, %%nclusterid.x;" : "=r"(r)); return r; }
+__device__ __forceinline__ void cl_sync() { asm volatile("barrier.cluster.arrive.aligned;\nbarrier.cluster.wait.aligned;" ::: "memory"); }
+__device__ __forceinline__ uint64_t desc(uint32_t a) {
+  return static_cast<uint64_t>((a & 0x3FFFF) >> 4) | (static_cast<uint64_t>(1024 >> 4) << 32) | (1ull << 62);
+}
+__device__ __forceinline__ void wg_fence() { asm volatile("wgmma.fence.sync.aligned;" ::: "memory"); }
+__device__ __forceinline__ void wg_commit() { asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory"); }
+template <int N> __device__ __forceinline__ void wg_wait() { asm volatile("wgmma.wait_group.sync.aligned %0;" ::"n"(N) : "memory"); }
+__device__ __forceinline__ void fence_acc(int (&d)[64]) {
+#pragma unroll
+  for (int i = 0; i < 64; ++i) asm volatile("" : "+r"(d[i])::"memory");
+}
+__device__ __forceinline__ void iwgmma(int (&d)[64], uint64_t da, uint64_t db) {
+  asm volatile(
+      "{\n.reg .pred p;\nsetp.ne.b32 p, %66, 0;\n"
+      "wgmma.mma_async.sync.aligned.m64n128k32.s32.s8.s8 {"
+      "%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, "
+      "%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, "
+      "%32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, "
+      "%48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63"
+      "}, %64, %65, p;\n}\n"
+      : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3]), "+r"(d[4]), "+r"(d[5]), "+r"(d[6]), "+r"(d[7]),
+        "+r"(d[8]), "+r"(d[9]), "+r"(d[10]), "+r"(d[11]), "+r"(d[12]), "+r"(d[13]), "+r"(d[14]), "+r"(d[15]),
+        "+r"(d[16]), "+r"(d[17]), "+r"(d[18]), "+r"(d[19]), "+r"(d[20]), "+r"(d[21]), "+r"(d[22]), "+r"(d[23]),
+        "+r"(d[24]), "+r"(d[25]), "+r"(d[26]), "+r"(d[27]), "+r"(d[28]), "+r"(d[29]), "+r"(d[30]), "+r"(d[31]),
+        "+r"(d[32]), "+r"(d[33]), "+r"(d[34]), "+r"(d[35]), "+r"(d[36]), "+r"(d[37]), "+r"(d[38]), "+r"(d[39]),
+        "+r"(d[40]), "+r"(d[41]), "+r"(d[42]), "+r"(d[43]), "+r"(d[44]), "+r"(d[45]), "+r"(d[46]), "+r"(d[47]),
+        "+r"(d[48]), "+r"(d[49]), "+r"(d[50]), "+r"(d[51]), "+r"(d[52]), "+r"(d[53]), "+r"(d[54]), "+r"(d[55]),
+        "+r"(d[56]), "+r"(d[57]), "+r"(d[58]), "+r"(d[59]), "+r"(d[60]), "+r"(d[61]), "+r"(d[62]), "+r"(d[63])
+      : "l"(da), "l"(db), "r"(1));
+}
+struct Args {
+  const float* xs;  // [2 M]: term-1 row scales, then term-2
+  const float* ws;  // [N] weight row scales
+  void* out;        // [M, N] fp32 (bf16-rounded values) or bf16
+  int M, N, f32_out, tiles;
+};
+__global__ void __launch_bounds__(384, 1) lmh8_kernel(const __grid_constant__ CUtensorMap tw, const __grid_constant__ CUtensorMap tx, const Args a) {
+  extern __shared__ uint8_t smem_raw[];
+  const uint32_t base = (smem_u32(smem_raw) + 1023u) & ~1023u;
+  __shared__ __align__(8) uint64_t full[STAGES], empty[STAGES];
+  __shared__ float s_xs[2 * BT];
+  const int tid = threadIdx.x, wg = tid / 128, warp = tid / 32, lane = tid % 32, wi = warp % 4;
+  const uint32_t rank = cl_rank();
+  const int pairs = a.tiles / 2, u0 = static_cast<int>(cl_id()), ustep = static_cast<int>(cl_n());
+  if (tid == 0) {
+    for (int s = 0; s < STAGES; ++s) { mbar_init(&full[s], 1); mbar_init(&empty[s], 16); }
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  for (int i = tid; i < 2 * BT; i += blockDim.x) {
+    const int t = i % BT, term = i / BT;
+    s_xs[i] = t < a.M ? a.xs[term * a.M + t] : 0.f;
+  }
+  __syncthreads();
+  cl_sync();
+  if (wg == 2) {
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 40;\n" ::: "memory");
+    if (tid == 256) {
+      uint64_t pol_w, pol_x;
+      asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol_w));
+      asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(pol_x));
+      int stage = 0;
+      uint32_t phase = 0;
+      for (int u = u0; u < pairs; u += ustep) {
+        const int v0 = (2 * u + static_cast<int>(rank)) * BV;
+        for (int kb = 0; kb < KB; ++kb) {
+          mbar_wait(&empty[stage], phase ^ 1);
+          mbar_expect(&full[stage], SBYTES);
+          const uint32_t sb = base + stage * SBYTES;
+          tma2d(sb, &tw, &full[stage], kb * BK, v0, pol_w);
+          // this CTA's token term (rows [term M, term M + BT) of xq, zero past each term's M rows via the map) for both CTAs
+          tma2d_mc(sb + WBYTES + rank * XBYTES, &tx, &full[stage], kb * BK, static_cast<int>(rank) * a.M, 3, pol_x);
+          stage = stage + 1 == STAGES ? 0 : stage + 1;
+          phase ^= stage == 0;
+        }
+      }
+    }
+  } else {
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 232;\n" ::: "memory");
+    int stage = 0;
+    uint32_t phase = 0;
+    int a1[64], a2[64];
+    for (int u = u0; u < pairs; u += ustep) {
+      const int v0 = (2 * u + static_cast<int>(rank)) * BV;
+#pragma unroll
+      for (int i = 0; i < 64; ++i) a1[i] = 0, a2[i] = 0;
+      int prev = -1;
+      for (int kb = 0; kb < KB; ++kb) {
+        mbar_wait(&full[stage], phase);
+        const uint32_t sb = base + stage * SBYTES, w_ = sb + wg * 64 * BK, x1 = sb + WBYTES, x2 = sb + WBYTES + XBYTES;
+        fence_acc(a1);
+        fence_acc(a2);
+        wg_fence();
+#pragma unroll
+        for (int k = 0; k < BK / 32; ++k) iwgmma(a1, desc(w_ + 32 * k), desc(x1 + 32 * k));
+#pragma unroll
+        for (int k = 0; k < BK / 32; ++k) iwgmma(a2, desc(w_ + 32 * k), desc(x2 + 32 * k));
+        wg_commit();
+        fence_acc(a1);
+        fence_acc(a2);
+        wg_wait<1>();
+        if (prev >= 0 && lane < 2) mbar_arrive_cl(&empty[prev], lane);
+        prev = stage;
+        stage = stage + 1 == STAGES ? 0 : stage + 1;
+        phase ^= stage == 0;
+      }
+      wg_wait<0>();
+      fence_acc(a1);
+      fence_acc(a2);
+      if (lane < 2) mbar_arrive_cl(&empty[prev], lane);
+      // a[4 j + q]: vocab row v0 + 64 wg + 16 wi + lane / 4 (+8 for q >= 2), token 8 j + 2 (lane % 4) + (q & 1)
+      const int vr = v0 + 64 * wg + 16 * wi + lane / 4;
+      const float wa = a.ws[vr], wb = a.ws[vr + 8];
+#pragma unroll
+      for (int j = 0; j < 16; ++j)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          const int t = 8 * j + 2 * (lane % 4) + (q & 1);
+          if (t < a.M) {
+            const int v = vr + (q >= 2 ? 8 : 0);
+            // Triton's contraction of acc * xs + acc2 * xs2 fuses the first product: fma(acc, xs, acc2 * xs2)
+            float r = __fmaf_rn(static_cast<float>(a1[4 * j + q]), s_xs[t], __fmul_rn(static_cast<float>(a2[4 * j + q]), s_xs[BT + t]));
+            r = __fmul_rn(r, q >= 2 ? wb : wa);
+            const __nv_bfloat16 h = __float2bfloat16_rn(r);
+            if (a.f32_out)
+              reinterpret_cast<float*>(a.out)[static_cast<int64_t>(t) * a.N + v] = __bfloat162float(h);
+            else
+              reinterpret_cast<__nv_bfloat16*>(a.out)[static_cast<int64_t>(t) * a.N + v] = h;
+          }
+        }
+    }
+  }
+  cl_sync();  // no CTA leaves while its peer may still multicast into it or arrive on its barriers
+}
+using EncodeFn = CUresult (*)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*, const cuuint64_t*,
+                              const cuuint32_t*, const cuuint32_t*, CUtensorMapInterleave, CUtensorMapSwizzle,
+                              CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
+static CUtensorMap map8(void* ptr, uint64_t inner, uint64_t outer, uint32_t box_outer) {
+  static EncodeFn fn = nullptr;
+  if (!fn) {
+    void* p = nullptr; cudaDriverEntryPointQueryResult q;
+    C10_CUDA_CHECK(cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &p, cudaEnableDefault, &q));
+    TORCH_CHECK(p != nullptr && q == cudaDriverEntryPointSuccess, "cuTensorMapEncodeTiled is unavailable");
+    fn = reinterpret_cast<EncodeFn>(p);
+  }
+  CUtensorMap m;
+  const cuuint64_t dims[2] = {inner, outer}, strides[1] = {inner};
+  const cuuint32_t box[2] = {BK, box_outer}, es[2] = {1, 1};
+  TORCH_CHECK(fn(&m, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, ptr, dims, strides, box, es, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                 CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS,
+              "cuTensorMapEncodeTiled failed");
+  return m;
+}
+}  // namespace lmh8
+// xq [2 M, 2048] int8 (term 1 rows, then term 2), xs [2 M] fp32, q [N, 2048] int8, ws [N] fp32, out [M, N] fp32 / bf16
+void lmh8_w8a8x2(torch::Tensor xq, torch::Tensor xs, torch::Tensor q, torch::Tensor ws, torch::Tensor out) {
+  using namespace lmh8;
+  const int64_t M = out.size(0), N = out.size(1);
+  TORCH_CHECK(M >= 1 && M <= BT, "lmh8: 1..128 rows");
+  TORCH_CHECK(xq.is_cuda() && xq.element_size() == 1 && xq.is_contiguous() && xq.size(0) == 2 * M && xq.size(1) == K, "xq [2M, 2048] int8");
+  TORCH_CHECK(q.element_size() == 1 && q.is_contiguous() && q.size(0) == N && q.size(1) == K && N % (2 * BV) == 0, "q [N, 2048] int8, N % 256 == 0");
+  TORCH_CHECK(xs.scalar_type() == at::kFloat && xs.numel() == 2 * M && ws.scalar_type() == at::kFloat && ws.numel() == N &&
+                  xs.is_contiguous() && ws.is_contiguous(), "scales fp32");
+  TORCH_CHECK(out.is_contiguous() && (out.scalar_type() == at::kFloat || out.scalar_type() == at::kBFloat16), "out fp32 / bf16");
+  const at::cuda::CUDAGuard guard(xq.device());
+  // the token map spans xq's 2 M rows; each term's box reads BT rows from the term's first row (term 1's box runs into
+  // term 2's rows when M < BT and term 2's past row 2 M reads zero): columns t >= M are computed but never stored
+  Args args{xs.data_ptr<float>(), ws.data_ptr<float>(), out.data_ptr(), static_cast<int>(M), static_cast<int>(N),
+            out.scalar_type() == at::kFloat ? 1 : 0, static_cast<int>(N / BV)};
+  const CUtensorMap mw = map8(q.data_ptr(), K, N, BV);
+  const CUtensorMap mx = map8(xq.data_ptr(), K, 2 * M, BT);
+  static int clusters = 0;
+  cudaLaunchConfig_t cfg = {};
+  cudaLaunchAttribute cattr[1];
+  cattr[0].id = cudaLaunchAttributeClusterDimension;
+  cattr[0].val.clusterDim.x = 2; cattr[0].val.clusterDim.y = 1; cattr[0].val.clusterDim.z = 1;
+  cfg.blockDim = dim3(384);
+  cfg.dynamicSmemBytes = SMEM;
+  cfg.stream = at::cuda::getCurrentCUDAStream();
+  cfg.attrs = cattr;
+  cfg.numAttrs = 1;
+  if (clusters == 0) {
+    C10_CUDA_CHECK(cudaFuncSetAttribute(lmh8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
+    const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    cfg.gridDim = dim3(sms / 2 * 2);
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveClusters(&clusters, lmh8_kernel, &cfg));
+    TORCH_CHECK(clusters > 0, "lmh8 cannot be resident as a 2-CTA cluster");
+  }
+  cfg.gridDim = dim3(2 * std::min<int64_t>(clusters, args.tiles / 2));
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, lmh8_kernel, mw, mx, args));
+}
+// kb8: lm_head W8A16 GEMM for 1..16 verify / decode rows (qwen36_lmhead8/lmhead8.py CUDA_ROWS), bit for bit the Triton
+// _w8a16_kernel's 16-row config: per (vocab row, token) one chain of wgmma m64n16k16 bf16 steps in increasing k (int8
+// weights are exact in bf16; A from registers), from zero over K = 2048, then round(acc * s[n]). Persistent; each consumer
+// warpgroup owns 64-row vocab tiles and a TMA ring of int8 weight stages; the token rows stay in shared memory.
+namespace lmh16 {
+// 3 consumer warpgroups x 2 weight stages each (lmh/t_lmh16.py sweep: 174 us at 16 rows vs Triton 193; 171 us is the
+// stream's own floor with no math)
+constexpr int BV = 64, BT = 16, K = 2048, BKW = 128, KBW = K / BKW, STAGES = 2, CWG = 3, NTHR = 128 * (CWG + 1);
+constexpr uint32_t WST = BV * BKW;                 // 8 KB int8 weight stage
+constexpr uint32_t XCH = BT * 128, XBYTES = (K / 64) * XCH;  // 32 chunks of [16 rows x 64 bf16] = 64 KB
+constexpr uint32_t SMEM = XBYTES + CWG * STAGES * WST + 1024;
+static_assert(SMEM <= 232448 - 1024, "lmh16 smem");
+__device__ __forceinline__ uint32_t smem_u32(const void* p) { return static_cast<uint32_t>(__cvta_generic_to_shared(p)); }
+__device__ __forceinline__ void mbar_init(uint64_t* b, uint32_t n) { asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(smem_u32(b)), "r"(n)); }
+__device__ __forceinline__ void mbar_expect(uint64_t* b, uint32_t x) { asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_u32(b)), "r"(x) : "memory"); }
+__device__ __forceinline__ void mbar_arrive(uint64_t* b) { asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_u32(b)) : "memory"); }
+__device__ __forceinline__ void mbar_wait(uint64_t* b, uint32_t ph) {
+  asm volatile("{\n.reg .pred p;\nW_%=:\nmbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n@!p bra W_%=;\n}\n" ::"r"(smem_u32(b)), "r"(ph) : "memory");
+}
+__device__ __forceinline__ void tma2d(uint32_t dst, const CUtensorMap* m, uint64_t* b, int c0, int c1, uint64_t pol) {
+  asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1, {%3, %4}], [%2], %5;" ::"r"(dst),
+               "l"(reinterpret_cast<uint64_t>(m)), "r"(smem_u32(b)), "r"(c0), "r"(c1), "l"(pol) : "memory");
+}
+__device__ __forceinline__ uint64_t desc(uint32_t a) {
+  return static_cast<uint64_t>((a & 0x3FFFF) >> 4) | (static_cast<uint64_t>(1024 >> 4) << 32) | (1ull << 62);
+}
+__device__ __forceinline__ void wg_fence() { asm volatile("wgmma.fence.sync.aligned;" ::: "memory"); }
+__device__ __forceinline__ void wg_commit() { asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory"); }
+template <int N> __device__ __forceinline__ void wg_wait() { asm volatile("wgmma.wait_group.sync.aligned %0;" ::"n"(N) : "memory"); }
+__device__ __forceinline__ void fence8(float (&d)[8]) {
+#pragma unroll
+  for (int i = 0; i < 8; ++i) asm volatile("" : "+f"(d[i])::"memory");
+}
+// wgmma m64n16k16 f32 += bf16 (A registers) x bf16 (B shared, K-major)
+__device__ __forceinline__ void wg16(float (&d)[8], const uint32_t (&a)[4], uint64_t db, int scale_d) {
+  asm volatile(
+      "{\n.reg .pred p;\nsetp.ne.b32 p, %13, 0;\n"
+      "wgmma.mma_async.sync.aligned.m64n16k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9, %10, %11}, %12, p, 1, 1, 0;\n}\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(db), "r"(scale_d));
+}
+// two int8 (low byte first) -> bf16x2, exact (Triton's conversion): 0x43 | (b & 0x7f) is 128 + (b & 0x7f), 0x43 | (b & 0x80)
+// is 128 or 256; their difference is the int8 value
+__device__ __forceinline__ uint32_t i8x2_bf16x2(uint32_t two) {
+  uint32_t l0, r;
+  asm("prmt.b32 %0, %1, 0x43, 0x4140;" : "=r"(l0) : "r"(two));
+  const uint32_t l1 = l0 & 0xff7fff7fu, l2 = l0 & 0xff80ff80u;
+  asm("sub.bf16x2 %0, %1, %2;" : "=r"(r) : "r"(l1), "r"(l2));
+  return r;
+}
+struct Args {
+  const float* s;  // [N] row scales
+  void* out;       // [M, N] fp32 (bf16-rounded) or bf16
+  int M, N, f32_out, tiles;
+};
+__device__ __forceinline__ void load_a(uint32_t (&A)[8][4], const uint8_t* wt, int r0, int r1, int q4) {
+  // the A fragments of one 128-k weight stage: step s, rows r0 / r1, k 16 s + 2 q4 (+1) and + 8; row = 128 B, 16-B chunk
+  // c sits at c ^ (row & 7) (TMA 128-B swizzle)
+#pragma unroll
+  for (int s = 0; s < BKW / 16; ++s) {
+    const uint16_t* p0 = reinterpret_cast<const uint16_t*>(wt + r0 * 128 + ((s ^ (r0 & 7)) * 16));
+    const uint16_t* p1 = reinterpret_cast<const uint16_t*>(wt + r1 * 128 + ((s ^ (r1 & 7)) * 16));
+    A[s][0] = i8x2_bf16x2(p0[q4]);
+    A[s][1] = i8x2_bf16x2(p1[q4]);
+    A[s][2] = i8x2_bf16x2(p0[4 + q4]);
+    A[s][3] = i8x2_bf16x2(p1[4 + q4]);
+  }
+}
+__device__ __forceinline__ void mma_stage(float (&acc)[8], uint32_t (&A)[8][4], uint32_t xs, int kb) {
+  fence8(acc);
+  wg_fence();
+#pragma unroll
+  for (int s = 0; s < BKW / 16; ++s) {
+    const int kk = kb * BKW + 16 * s;  // absolute k of this step: x chunk kk / 64, 32 B per k16 inside it
+    wg16(acc, A[s], desc(xs + (kk / 64) * XCH + ((kk % 64) / 16) * 32), 1);
+  }
+  wg_commit();
+}
+__global__ void __launch_bounds__(NTHR, 1) lmh16_kernel(const __grid_constant__ CUtensorMap tw, const __grid_constant__ CUtensorMap tx, const Args a) {
+  extern __shared__ uint8_t smem_raw[];
+  const uint32_t base = (smem_u32(smem_raw) + 1023u) & ~1023u;
+  uint8_t* sb = smem_raw + (base - smem_u32(smem_raw));
+  __shared__ __align__(8) uint64_t full[CWG][STAGES], empty[CWG][STAGES], xbar;
+  const int tid = threadIdx.x, wg = tid / 128, warp = tid / 32, lane = tid % 32, wi = warp % 4;
+  const uint32_t xs = base, ws0 = base + XBYTES;  // ring of warpgroup w at ws0 + w * STAGES * WST
+  if (tid == 0) {
+    for (int w = 0; w < CWG; ++w)
+      for (int s = 0; s < STAGES; ++s) { mbar_init(&full[w][s], 1); mbar_init(&empty[w][s], 4); }
+    mbar_init(&xbar, 1);
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  __syncthreads();
+  // vocab tiles of consumer w: (blockIdx.x * CWG + w) + i * (CWG * gridDim.x)
+  const int tstep = CWG * gridDim.x;
+  if (wg == CWG) {
+    if (lane == 0 && warp < 4 * CWG + CWG) {
+      const int w = warp - 4 * CWG;
+      uint64_t pol;
+      asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+      if (w == 0) {
+        mbar_expect(&xbar, XBYTES);
+        for (int c = 0; c < K / 64; ++c) tma2d(xs + c * XCH, &tx, &xbar, c * 64, 0, 0x1000000000000000ull);
+      }
+      int stage = 0;
+      uint32_t phase = 0;
+      for (int t = blockIdx.x * CWG + w; t < a.tiles; t += tstep)
+        for (int kb = 0; kb < KBW; ++kb) {
+          mbar_wait(&empty[w][stage], phase ^ 1);
+          mbar_expect(&full[w][stage], WST);
+          tma2d(ws0 + (w * STAGES + stage) * WST, &tw, &full[w][stage], kb * BKW, t * BV, pol);
+          stage = stage + 1 == STAGES ? 0 : stage + 1;
+          phase ^= stage == 0;
+        }
+    }
+    return;
+  }
+  mbar_wait(&xbar, 0);
+  const int g = lane / 4, q4 = lane % 4, r0 = 16 * wi + g, r1 = r0 + 8;
+  int stage = 0;
+  uint32_t phase = 0;
+  uint32_t A0[8][4];
+  float acc[8];
+  // takes the next weight stage into A (the stage is free again once its bytes sit in registers)
+  auto next = [&](uint32_t (&A)[8][4]) {
+    mbar_wait(&full[wg][stage], phase);
+    load_a(A, sb + XBYTES + (wg * STAGES + stage) * WST, r0, r1, q4);
+    __syncwarp();
+    if (lane == 0) mbar_arrive(&empty[wg][stage]);
+    stage = stage + 1 == STAGES ? 0 : stage + 1;
+    phase ^= stage == 0;
+  };
+  for (int t = blockIdx.x * CWG + wg; t < a.tiles; t += tstep) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) acc[i] = 0.f;
+    // one weight stage at a time: its 8 wgmma back to back, then wait (A-fragment loads overlapping an in-flight group
+    // make ptxas serialize the wgmma chain; the other consumers' TMA rings hide the latency instead)
+#pragma unroll 1
+    for (int kb = 0; kb < KBW; ++kb) {
+      next(A0);
+      mma_stage(acc, A0, xs, kb);
+      wg_wait<0>();
+    }
+    wg_wait<0>();
+    fence8(acc);
+    // acc[4 j + q]: vocab row t * 64 + r0 (+8 for q >= 2), token 8 j + 2 q4 + (q & 1)
+    const int v0 = t * BV + r0;
+    const float s0 = a.s[v0], s1 = a.s[v0 + 8];
+#pragma unroll
+    for (int j = 0; j < 2; ++j)
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        const int tok = 8 * j + 2 * q4 + (q & 1), v = v0 + (q >= 2 ? 8 : 0);
+        if (tok < a.M) {
+          const __nv_bfloat16 h = __float2bfloat16_rn(__fmul_rn(acc[4 * j + q], q >= 2 ? s1 : s0));
+          if (a.f32_out) reinterpret_cast<float*>(a.out)[static_cast<int64_t>(tok) * a.N + v] = __bfloat162float(h);
+          else reinterpret_cast<__nv_bfloat16*>(a.out)[static_cast<int64_t>(tok) * a.N + v] = h;
+        }
+      }
+  }
+}
+using EncodeFn = CUresult (*)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*, const cuuint64_t*,
+                              const cuuint32_t*, const cuuint32_t*, CUtensorMapInterleave, CUtensorMapSwizzle,
+                              CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
+static EncodeFn encode() {
+  static EncodeFn fn = nullptr;
+  if (!fn) {
+    void* p = nullptr; cudaDriverEntryPointQueryResult q;
+    C10_CUDA_CHECK(cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &p, cudaEnableDefault, &q));
+    TORCH_CHECK(p != nullptr && q == cudaDriverEntryPointSuccess, "cuTensorMapEncodeTiled is unavailable");
+    fn = reinterpret_cast<EncodeFn>(p);
+  }
+  return fn;
+}
+}  // namespace lmh16
+// x [M <= 16, 2048] bf16, q [N, 2048] int8, s [N] fp32 -> out [M, N] fp32 (bf16-rounded) / bf16
+void lmh16_w8a16(torch::Tensor x, torch::Tensor q, torch::Tensor s, torch::Tensor out) {
+  using namespace lmh16;
+  const int64_t M = x.size(0), N = q.size(0);
+  TORCH_CHECK(M >= 1 && M <= BT && x.size(1) == K && x.scalar_type() == at::kBFloat16 && x.is_contiguous(), "x [1..16, 2048] bf16");
+  TORCH_CHECK(q.element_size() == 1 && q.is_contiguous() && q.size(1) == K && N % BV == 0, "q [N, 2048] int8");
+  TORCH_CHECK(s.scalar_type() == at::kFloat && s.numel() == N && s.is_contiguous(), "s [N] fp32");
+  TORCH_CHECK(out.is_contiguous() && out.size(0) == M && out.size(1) == N && (out.scalar_type() == at::kFloat || out.scalar_type() == at::kBFloat16), "out");
+  const at::cuda::CUDAGuard guard(x.device());
+  CUtensorMap mw, mx;
+  {
+    const cuuint64_t dims[2] = {static_cast<cuuint64_t>(K), static_cast<cuuint64_t>(N)}, strides[1] = {static_cast<cuuint64_t>(K)};
+    const cuuint32_t box[2] = {BKW, BV}, es[2] = {1, 1};
+    TORCH_CHECK(encode()(&mw, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, q.data_ptr(), dims, strides, box, es, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                         CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS, "w map");
+  }
+  {
+    const cuuint64_t dims[2] = {static_cast<cuuint64_t>(K), static_cast<cuuint64_t>(M)}, strides[1] = {static_cast<cuuint64_t>(K) * 2};
+    const cuuint32_t box[2] = {64, BT}, es[2] = {1, 1};
+    TORCH_CHECK(encode()(&mx, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, x.data_ptr(), dims, strides, box, es, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                         CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS, "x map");
+  }
+  Args args{s.data_ptr<float>(), out.data_ptr(), static_cast<int>(M), static_cast<int>(N), out.scalar_type() == at::kFloat ? 1 : 0,
+            static_cast<int>(N / BV)};
+  static bool attr = false;
+  if (!attr) { C10_CUDA_CHECK(cudaFuncSetAttribute(lmh16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM)); attr = true; }
+  const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  lmh16_kernel<<<sms, NTHR, SMEM, at::cuda::getCurrentCUDAStream()>>>(mw, mx, args);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("lmh16_w8a16", &lmh16_w8a16, "kb8: lm_head W8A16 GEMM (1..16 rows), bit for bit qwen36_lmhead8 lmhead8 Triton");
+  m.def("lmh8_w8a8x2", &lmh8_w8a8x2, "kb6: lm_head W8A8 two-term GEMM (65..128 rows), bit for bit qwen36_lmhead8 w8a8 Triton");
   m.def("gdn_in_proj", &gdn_in_proj, "GDN in_proj_qkvz + in_proj_ba at decode widths");
   m.def("qkv_proj", &qkv_proj, "attention qkv_proj at decode widths");
   m.attr("MAX_T") = MAX_T;

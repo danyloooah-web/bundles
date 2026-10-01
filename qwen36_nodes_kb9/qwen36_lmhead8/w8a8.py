@@ -84,9 +84,25 @@ def quantize_act(x: torch.Tensor, xq: torch.Tensor | None=None, xs: torch.Tensor
     _quant_act_kernel[M,](x, xq, xs, x.stride(0), xq.stride(0), K, M, BLOCK_K=triton.next_power_of_2(K), TWO_TERM=two_term, num_warps=4)
     return (xq, xs)
 
+try:
+    import qk_proj_decode as _qpd  # kb6: the CUDA two-term GEMM (qk_proj_decode.cu, namespace lmh8)
+except ImportError:  # CPU interpreter checks run without the CUDA units
+    _qpd = None
+# kb6 (bit for bit): two-term row batches in this range take qk_proj_decode.lmh8_w8a8x2 (lmh/t_lmh.py: 0 mismatches
+# against _w8a8_kernel at 64..128 rows; -7..-11 % at 68..128 rows, slower at 64)
+CUDA_TWO_TERM_ROWS = (65, 128)
+
+def cuda_two_term(M: int, N: int, K: int, out: torch.Tensor) -> bool:
+    return (_qpd is not None and CUDA_TWO_TERM_ROWS[0] <= M <= CUDA_TWO_TERM_ROWS[1] and K == 2048 and N % 256 == 0
+            and out.dtype in (torch.float32, torch.bfloat16) and out.is_contiguous())
+
 def w8a8_gemm(xq: torch.Tensor, xs: torch.Tensor, q: torch.Tensor, w_scale: torch.Tensor, out: torch.Tensor, config: tuple[int, int, int, int, int] | None=None, two_term: bool=False) -> torch.Tensor:
     M, N = out.shape
     K = xq.shape[1]
+    if (two_term and config is None and cuda_two_term(M, N, K, out) and q.is_contiguous() and xq.is_contiguous()
+            and q.shape == (N, K) and xq.shape[0] == 2 * M and w_scale.dim() == 1 and w_scale.is_contiguous()):
+        _qpd.lmh8_w8a8x2(xq, xs, q, w_scale, out)
+        return out
     if q.shape[1] != K or q.shape[0] != N or xq.shape[0] != (2 if two_term else 1) * M or (xq.stride(1) != 1) or (q.stride(1) != 1) or (w_scale.dim() != 1):
         raise ValueError('w8a8_gemm: K-contiguous int8 operands, M (or 2M) activation rows and a per-row weight scale are required')
     block_n, block_m, block_k, num_warps, num_stages = config or pick_config(M, two_term)
