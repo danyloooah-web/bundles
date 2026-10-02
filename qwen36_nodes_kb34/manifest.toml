@@ -1,0 +1,157 @@
+bundle_id = "qwen36-nodes-kb34"
+abi_version = "cacheon-op-abi-v0"
+
+[competition]
+target = "forward_pass"
+mode = "slot"
+arena = "qwen36-35b-h100-bf16-tp1"
+
+
+# v2 port = b0e9d402 (qwen36-nodes-k2fp8y18 = b9d3c95a + tanh.approx silu in up_i8g; b9d3c95a = a70adc41's inproj16 +
+# INT8 prefill up8 + channel-scaled INT8 experts, with int8 y / quant_img) with our orthogonal levers, each behind its own switch (OFF = the parent exactly):
+#   * lane dense (qwen36_layer/dense8.py LANE_DENSE, NOT bitwise): the attention qkv_proj and every decode o_proj /
+#     out_proj join DENSE8's runtime INT8 copies at <= 32 verify rows through qk_proj_decode.cu's qd8 W8A16 kernel; the
+#     GDN in_proj keeps the parent's qk_route.inproj16 at <= 16 rows.
+#   * lane PDENSE + pd38 (qwen36_layer/pdense.py ENABLED / PD38, NOT bitwise): the GDN prefill in_proj [q|k|v|z] in INT8
+#     with per-chunk smoothing (qk_inproj.cu, namespace qin8) on every recurrent layer; layer 38's prefill out_proj BF16.
+#   * lane P up (qwen36_layer/i8x_kernels.py UP_PATH per shape class, NOT bitwise): our W8A8 prefill routed up
+#     (qk_moe_prefill_i8.up_w8a8; ping-pong promotion PREFILL_UP_PP) in place of up_i8g, the parent's y8 down kept.
+#   * lane PD2 (qwen36_layer/i8x_kernels.py DOWN_W8A8 per shape class, NOT bitwise): our W8A8 prefill routed down
+#     (qk_moe_prefill_i8.down_w8a8), its routed y int8 per row x 128 columns on the parent's y8 layers (kY128 combine).
+#   * lane FUSED (qwen36_layer/i8x_decode.py FUSED, BIT FOR BIT): decode row batches of FUSED_MIN..16 rows run the
+#     persistent fused decode MoE (qk_moe_up16.cu `fused`) in place of the up16 / dn16 / Triton up + down pair.
+#   * kb4 (BIT FOR BIT): the INT8 prefill in_proj (qk_inproj.cu, namespace qin8) runs its conv front on seven epilogue
+#     warps (512 threads, setmaxnreg 168 / 88) instead of three; the arithmetic of every token is unchanged.
+#   * kb6 (BIT FOR BIT): the lm_head's W8A8 two-term GEMM at 65..128 verify rows in CUDA (qk_proj_decode.cu namespace
+#     lmh8, qwen36_lmhead8/w8a8.py CUDA_TWO_TERM_ROWS) instead of the Triton _w8a8_kernel.
+#   * kb8 (BIT FOR BIT): the lm_head's W8A16 GEMM at 1..16 rows (c6 verify) in CUDA (qk_proj_decode.cu namespace lmh16,
+#     qwen36_lmhead8/lmhead8.py CUDA_ROWS) instead of the Triton _w8a16_kernel.
+#   * kb9 (BIT FOR BIT): the fused decode MoE leaves 8 SMs (was 16) to the next layer's in_proj prefetch
+#     (qwen36_layer/i8x_decode.py FUSED_GRID).
+#   * kb14 (BIT FOR BIT): the warp-specialized prefill MoE up (qk_moe_prefill_i8.cu up_g128p_kernel, chunks of
+#     >= UP_WS_MIN rows) keeps its consumer control flow in uniform registers (REDUX), builds each batch's wgmma
+#     descriptors once (+2 per k32 step) and runs the tanh epilogue in two phases; the same wgmmas, fold and
+#     per-element expression tree (T8192 -8..-10 %).
+#   * kb17 (BIT FOR BIT): the prefill route's IMG quantizer takes one reciprocal per 256-column group and multiplies
+#     (div.full.f32 is MUFU.RCP + FMUL for its normal divisors; qk_moe_prefill_i8.cu rcp_full_normal / mul_rn).
+#     The held-BF16 prefill down (moe_gemm_kernel) and the INT8 prefill in_proj (qin8 inproj8_kernel) keep their
+#     warpgroup / unit / tile flags in uniform registers (REDUX) and build each stage's wgmma descriptors once (+2 per
+#     k step); the in_proj stages its scales under the mainloop. Same wgmmas and per-element arithmetic.
+#   * kb18a (BIT FOR BIT): the fused decode MoE runs 8 producer / consumer pairs per CTA at 9..16 rows (was 7).
+#   * kb18 (BIT FOR BIT): the INT8 prefill in_proj (qin8) starts each tile's s32 accumulators with the first wgmma's
+#     scale-d = 0, runs the conv front's steps specialized per head kind and merges the four tokens' L2-norm
+#     butterflies (the same pairs added in the same order per token); qk_inproj.cu QA_PRO 2 / QA_FR / QA_NRM.
+#   * kb19 (BIT FOR BIT): the held-BF16 prefill down (moe_gemm_kernel) takes each resolved unit from its producer
+#     through a shared-memory ring instead of reloading pairs / mt between units (qk_moe_prefill_i8.cu QMOE_DN_SI), and its
+#     fused combine forms w * y-scale once per unit and keeps four rows of int8 y loads in flight per lane, with the
+#     consumer warpgroups at 232 registers (setmaxnreg; QMOE_DN_CJ / QMOE_DN_REGS). Same per-element arithmetic.
+#   * kb20 (BIT FOR BIT): pdense.py's chunk quantization runs in three launches with programmatic dependent launch
+#     (column amax into a persistent zeroed buffer, smoothing vector, x and weight rows in one grid) and the INT8
+#     in_proj (qin8) launches programmatically after it; the same arithmetic per element.
+#   * kb21 (BIT FOR BIT): fp8.py's row-wise FP8 projections run torch._scaled_mm's cuBLASLt GEMM through a
+#     zero-workspace, unsplit-K plan (qk_lt.cu fp8_linear: no per-call memsets), per shape only after it compared equal
+#     to _scaled_mm on a real call; qk_inproj.cu's front_prep releases the PDL chain early.
+#   * kb23n (BIT FOR BIT): a prefill chunk that routes through route_i8q (the fused INT8 up path) runs its post-attention
+#     Gemma add-RMSNorm as qk_moe_prefill_i8.cu add_norm_route (flashinfer's CuTe-DSL arithmetic, in place) and computes
+#     route_i8q's shared gate and IMG int8 rows from the normed bf16 rows in the same launch (route_topk's own code);
+#     the routing launch (route_i8q_pre) then reads only the router logits. Same bits for every tensor.
+#   * kb24 (BIT FOR BIT): fp8.py's row-wise FP8 projections run qk_lt.cu's own FP8 GEMM (fg11: cuBLASLt's recipe written
+#     out, 128 x 256 tiles, the next tile's first k block under each epilogue) where fp8_gemm_prefer holds; the prefill
+#     router logits go through lt.py (was F.linear; the same kernel at 8192 rows), which pins a swept cuBLASLt
+#     configuration for the router and GDN ba at 4096 / 2500-row chunks; every path only after it compared equal to
+#     its reference (_scaled_mm / F.linear) on a real call.
+#   * kb25e (BIT FOR BIT): a prefill chunk's INPUT norm (prepare_attn's Gemma fused add-RMSNorm) folds its consumer's
+#     first pass over the normed rows: a recurrent layer whose in_proj runs PDENSE runs qk_moe_prefill_i8.cu
+#     add_norm_amax (the CuTe-DSL norm in place + pdense._col_amax's column maxima max-ed into its persistent zeroed
+#     buffer; pdense.prepare skips _col_amax when every row is live), an attention layer whose q / gate projection runs
+#     in FP8 add_norm_fp8 (the norm + fp8.py's _q_rows of the normed rows, which the projection takes). Same bits for
+#     every tensor.
+#   * kb25n (BIT FOR BIT): the prefill routing launch after add_norm_route (route_i8q_pre) zeroes the m-tile list
+#     itself (no fill launch) and takes the shared expert's int8 gate/up rows from a copy made once per layer into an
+#     i8x idle tail (i8x_kernels._shared_rows; the same quantization blocks, run once) instead of 128 per-call blocks.
+#   * kb25p (BIT FOR BIT): the prefill paged attention (attn_fused._paged_attention) computes its page offsets / table
+#     once per forward batch (the first full-attention layer) and the other nine layers reuse the same tensors.
+#   * kb27f (BIT FOR BIT): the decode o_proj / out_proj INT8 partials at <= 32 verify rows (qk_proj_decode.cu dense8_kernel
+#     MODE 1) run two math warps per 16-row block (each chains every second scale group into shared memory, then one
+#     ordered fold per output) and two fp16 conversion warps whose stage loads go out together (dense8.py OPROJ_GS /
+#     OPROJ_NCV); the same products, chains and fold. c6 verify span -24 us at 16 rows, -5 us at 8 rows.
+#   * kb27g (BIT FOR BIT): those partials with four group lanes x two 16-row blocks per math warp (8 math warps; each
+#     token fragment loaded from shared memory feeds two blocks' mma chains: dense8.py OPROJ_GS 4 / OPROJ_RTL 2).
+#   * k28 (BIT FOR BIT, host side only): layer 0 of every prefill chunk has no GPU work queued ahead of its in_proj break,
+#     so the break's host path was GPU idle (pod2 c48 profile: ~200 us per chunk before layer 0's inproj8). The first
+#     layer's plain input norm is followed, in the same prefill graph segment, by pdense's column amax, smoothing vector
+#     and row quantization (pdense.col_amax / prepare_seg; layer.py PLAIN_NORM_AMAX / PLAIN_NORM_PREP) - the same Triton
+#     kernels and arguments; with a capture bucket's padded rows the break redoes them on the live rows as kb27 does -
+#     so the break launches none of them. (gdn.py GDN_CP_DIRECT, a direct call of flashinfer's CP
+#     launchers, is present but OFF in kb28.) The layer's conv / temporal state views
+#     are kept per pool and layer (gdn.py STATE_CACHE); branch evidence keeps its (pid, rank) once read. Same kernels,
+#     arguments and bits; layer-0 idle ~200 -> ~25-35 us per chunk (pod2 c48 profiles).
+#   * kb27i (BIT FOR BIT): the decode route above 16 rows (c48) runs qk_route.cu route48_kernel: one 8-CTA cluster per
+#     16-token block (CTA = expert half x K quarter, the gate chains exchanged over DSMEM instead of global partials and
+#     a per-block ticket), and at >= 128 rows 32 leading fill CTAs copy experts 0..5's up weights into L2 while
+#     the add-norm and route leave HBM idle (i8x_decode.py ROUTE48 / WARM_*). Same ids, weights and lists as route_kernel.
+#   * kb29i (BIT FOR BIT): route48 takes its own argument struct (R48Args) and its own copy of the top-8 tail, so
+#     route_kernel (the <= 16-row c6 route) is compiled from kb25's source unchanged.
+#   * kb30n (BIT FOR BIT): the lm_head's W8A8 two-term GEMM at 65..128 rows (qk_proj_decode.cu namespace lmh8) runs one
+#     m64n256k32 over both token terms per k32 step instead of two m64n128k32 (int32 sums are exact at any instruction
+#     shape), and its fp32-logits epilogue loads a lane's two token scales per term as one 8-byte load, rounds value
+#     pairs with one cvt.rn.bf16x2.f32 (round to nearest even per element, as cvt.rn.bf16.f32) and stores a full
+#     128-row batch without per-value bounds checks; the per-value expression is unchanged. Standalone (cold, graphs):
+#     256.7 -> 247.4 us at 128 rows, 257.3 -> 237.4 us at 100 rows; pod2 c48 profiles (128 rows, verify 15185):
+#     lmh8 254.7 / 255.2 -> 240.6 / 239.4 us per step (-15 us), step median 16.329 / 16.334 -> 16.316 / 16.306 ms.
+#     Every other kernel of the unit compiles to kb29i's SASS (39 of 40 functions byte-identical; only lmh8_kernel).
+#   * kb30m (BIT FOR BIT): decode row batches of 6..16 rows (c6 verify) route through qk_route.cu route16w_kernel
+#     (route_kernel<false, 16>'s outputs from its own argument struct and code; every other kernel's SASS unchanged):
+#     16 leading fill CTAs pick the layer's 6 most likely experts from a per-layer EMA of the previous decode steps'
+#     expert counts (int32 [256] per layer in an i8x idle tail, updated by the route's list builder; the top 6 are used
+#     in the next step 97 % of the time at 16 rows, 84 % at 8) and issue L2 prefetches of their up rows and scales
+#     while the add-norm and the route leave HBM mostly idle; the fused decode MoE then reads them from L2
+#     (i8x_decode.py W16_*). c6 verify-graph span vs kb29i (local H100, m30 test build): w1 -113 us (-2.0 %),
+#     w2 -84 us (-2.1 %); same verify sums.
+#     Whole-cell c6_64k time (Toronto, unprofiled, rotated, clean runs): fill at 6..16 rows 21.45 / 21.52 / 21.48 s,
+#     at 9..16 rows only 21.57 / 21.53 / 21.59 s, kb29i 21.70 s -> the 8-row fill stays on.
+#   * kb30nf (BIT FOR BIT): the decode combine-norm is combine_norm_kernel<DISC> (qk_route.cu). DISC = false (<= 16 rows,
+#     c6) is kb29i's kernel (same CnArgs; identical SASS, 746 instructions, REG 75). DISC = true (> 16 rows, c48) takes
+#     CnArgsD (+ the MoE's h rows) and drops the MoE workspace's dead rows from L2 as soon as they are dead, through
+#     discard.global.L2 (the lines leave L2 without a write-back to HBM): the token's nine h rows (the up's SwiGLU output,
+#     last read by the down) right after its dependency wait, and each warp's 9 x 4 lines of the token's nine cache rows
+#     (8 routed slots + the shared slot) right after the warp's own loads of them. The next layer's MoE rewrites both
+#     buffers before any read; i8x_decode._combine passes ws.inter. Values unchanged: the dirty lines' write-backs
+#     otherwise land in the following HBM-bound kernels (gdn_verify, out_proj, in_proj) of a c48 step that runs at
+#     the 700 W cap. pod2 c48 (c48_8k --start 150 --steps 30, verify 15185, alternating pairs vs kb30n): vspan
+#     12.1437 / 12.1442 vs 12.2183 / 12.2231 ms, step 16.221 / 16.213 vs 16.306 / 16.318 ms (-0.08 / -0.10 ms):
+#     gdn_verify 27.9 vs 29.0 us, out_proj 9.7 vs 10.0, add_norm 9.7 vs 10.2, in_proj 19.1 vs 19.3; the combine-norm
+#     itself +0.4 us. c6 (<= 16 rows, kb29i's kernel): w1 vspan 5.5607 / 5.5516 vs 5.5588 / 5.5578, w2 3.9316 vs 3.9298.
+#     Toronto (kb30nd, same discards after the CTA barrier): step -73..-81 us, vspan -75..-79 us per c48 step.
+#   * kb30o (BIT FOR BIT): the prefill routing's scan and scatter (route_i8q_pre / route_i8o) run as one launch
+#     (qk_moe_prefill_i8.cu route_scan_scatter_kernel: every CTA recomputes the scan's integer prefix sums and scatters
+#     its share; the same m-tiles, pairs, offsets and per-expert rows); every other kernel of the unit compiles to
+#     kb29i's SASS. ~-3.5 us per MoE layer of a prefill chunk.
+#   * kb31m (BIT FOR BIT): at <= 4 verify requests (c6) the decode attention (qk_attn_verify.cu attn_verify_kernel<true>)
+#     combines its splits with the split combine's per-element arithmetic, but only the last 8 arrivals of a (request,
+#     KV head) group combine (256 / 8 dims each); the earlier splits leave at once, so the o_proj partials' CTAs take
+#     their SMs during the attention tail, and on their way out those splits prefetch the o_proj's INT8 rows into L2
+#     (attn_fused.py LASTC_COMBINE, dense8_store.peek). Larger batches run attn_verify_kernel<false>, whose SASS is
+#     the original kernel's. c6 attention layer (qkv end -> o_proj end, local, same build): w1 -2.75 us, w2 -1.56 us;
+#     verify-graph span w1 -26 us, w2 -16 us per step.
+#   * kb34 = kb29i + kb30n (qk_proj_decode.cu) + kb30m + kb30nf (qk_route.cu / i8x_decode.py three-way merged on
+#     kb29i, no overlapping hunks; == disc4.py on kb30m) + kb30o (qk_moe_prefill_i8.cu) + kb31m (qk_attn_verify.cu /
+#     attn_fused.py): disjoint units, all bit for bit. kb34 = kb33 with kb30nd -> kb30nf (combine_norm<DISC>).
+#   New kernels are merged into existing units (14 cuda_sources: the build's extensions.json is capped at 16 MiB).
+
+[[ops]]
+slot = "model.layers.*"
+source = "qwen36_layer/layer.py"
+entry = "forward"
+prepare = "prepare"
+dtypes = ["bfloat16"]
+architectures = ["sm90"]
+cuda_sources = ["qwen36_layer/qk_proj_decode.cu", "qwen36_layer/qk_gdn_verify.cu", "qwen36_layer/qk_attn_verify.cu", "qwen36_layer/qk_moe_decode.cu", "qwen36_layer/qk_moe_prefill.cu", "qwen36_layer/qk_moe_prefill_i8.cu", "qwen36_layer/qk_kv_pages.cu", "qwen36_layer/qk_conv_gate.cu", "qwen36_layer/qk_gated_norm.cu", "qwen36_layer/qk_inproj.cu", "qwen36_layer/qk_lt.cu", "qwen36_layer/qk_route.cu", "qwen36_layer/qk_moe_dn16.cu", "qwen36_layer/qk_moe_up16.cu"]
+
+[[ops]]
+slot = "logits_processor"
+source = "qwen36_lmhead8/node.py"
+entry = "forward"
+prepare = "prepare"
+dtypes = ["bfloat16"]
+architectures = ["sm90"]
